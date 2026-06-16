@@ -1,180 +1,310 @@
 # Frontistirio — Scheduling & Private Lessons Brain
 
-> **Purpose:** Documents how private lessons are tracked, how the scheduling system works with teacher/student availability, and how lesson PDFs are generated. Reference this for anything related to timetabling or lesson billing.
+> **Full-stack reference** for private lesson tracking, hourly rate pricing (store-level + per-student overrides), PDF billing export, and the availability constraint system. Covers backend models, routes, controller logic, and the Angular frontend.
 
 ---
 
-## Overview
+## Backend: Models
 
-The platform supports two lesson types:
-1. **Class lessons** — a scheduled class with multiple students in a classroom (tracked via `ScheduledLesson`)
-2. **Private lessons** — one-on-one (or small group) sessions tracked separately (`PrivateLesson`)
-
-Pricing is handled via **hourly rates** at the store level, with optional **per-student overrides**.
-
----
-
-## Models
-
-### PrivateLesson (`models/private-lessons.js`)
-
-```
-PrivateLesson {
-  store_id    → Store
-  start_time  Date (required)
-  end_time    Date (required)
-  duration    Number (hours)
-  course_id   → Course
-  student_id  → Student
-  period_id   → TeachingPeriod
-  isDeleted   Boolean
-  deletedAt   Date
-  createdBy / updatedBy → User
+### `models/private-lessons.js`
+```javascript
+{
+  store_id: ObjectId → Store (required),
+  start_time: Date (required),
+  end_time: Date (required),
+  duration: Number (hours, required, min: 0),
+  course_id: ObjectId → Course (required),
+  student_id: ObjectId → Student (required),
+  period_id: ObjectId → TeachingPeriod (required),
+  isDeleted: Boolean, deletedAt: Date,
+  createdBy/updatedBy: ObjectId → User,
+  timestamps: true
 }
 ```
 
-### ScheduledLesson (`models/scheduledLesson.js`)
-
-Used by the scheduler for recurring class lessons:
-
+### `models/scheduledLesson.js` (for future scheduler)
+```javascript
+{
+  store_id: ObjectId → Store,
+  period: ObjectId → TeachingPeriod,
+  dayOfWeek: Number (1–7),
+  startTime: String 'HH:mm', endTime: String 'HH:mm',
+  durationSlots: Number,
+  lessonType: Enum['CLASS', 'PRIVATE'],
+  class_id: ObjectId → ClassModel (for CLASS type),
+  student_ids: [ObjectId → Student] (for PRIVATE type),
+  course_id: ObjectId → Course (required),
+  teacher_id: ObjectId → Teacher (required),
+  room_id: ObjectId → Room (required),
+  locked: Boolean  // prevents auto-scheduler from moving this slot
+}
 ```
-ScheduledLesson {
-  store_id      → Store
-  period        → TeachingPeriod
-  dayOfWeek     Number (1=Mon ... 7=Sun)
-  startTime     String "HH:mm"
-  endTime       String "HH:mm"
-  durationSlots Number
-  lessonType    Enum["CLASS", "PRIVATE"]
 
-  // For CLASS lessons:
-  class_id      → ClassModel
+### `models/hourly_rates.js` (store-level rates)
+```javascript
+{
+  store_id: ObjectId → Store,
+  course_id: ObjectId → Course,
+  period_rates: [{
+    period: ObjectId → TeachingPeriod,
+    rate: Number (€/hour)
+  }],
+  isDeleted: Boolean
+}
+```
 
-  // For PRIVATE lessons:
-  student_ids   → [Student]
-
-  course_id     → Course (required)
-  teacher_id    → Teacher (required)
-  room_id       → Room (required)
-  locked        Boolean
+### `models/student_hourly_rates.js` (per-student overrides)
+```javascript
+{
+  store_id: ObjectId → Store,
+  student_id: ObjectId → Student,
+  course_id: ObjectId → Course,
+  period_rates: [{
+    period: ObjectId → TeachingPeriod,
+    rate: Number (€/hour)
+  }],
+  isDeleted: Boolean
 }
 ```
 
 ---
 
-## API Endpoints — Private Lessons (`routes/private-lessons.js`)
+## Backend: Routes
 
-| Method | Path | Description |
+### `/private-lessons` (`routes/private-lessons.js`)
+| Method | Path | Role | Controller |
+|---|---|---|---|
+| GET | `/private-lessons/get-student-private-lessons/:studentId` | isStoreUser | `getStudentPrivateLessons` |
+| POST | `/private-lessons/create-student-private-lesson` | isStoreUser | `createStudentPrivateLesson` |
+| POST | `/private-lessons/export-student-private-lessons` | isStoreUser | `exportStudentPrivateLessons` |
+| DELETE | `/private-lessons/delete-student-private-lesson` | isStoreUser | `deleteStudentPrivateLessons` |
+
+### `/pricing-settings` (hourly_rates routes)
+| Method | Path | Role |
 |---|---|---|
-| GET | `/private-lessons/student/:studentId` | Get lessons for a student (date range) |
-| POST | `/private-lessons/` | Create a private lesson |
-| PUT | `/private-lessons/:id` | Edit a private lesson |
-| DELETE | `/private-lessons/:id` | Delete a private lesson |
-| GET | `/private-lessons/student/:studentId/pdf` | Generate & upload PDF of lessons |
+| GET | `/pricing-settings/get-store-pricing-settings` | isStoreUser |
+| POST | `/pricing-settings/upsert-store-pricing-settings` | isStoreUser |
+| DELETE | `/pricing-settings/delete-store-pricing-setting` | isStoreUser |
+
+### `/student-pricing-settings` (student_hourly_rates routes)
+| Method | Path | Role |
+|---|---|---|
+| GET | `/student-pricing-settings/get-student-pricing-settings` | isStoreUser |
+| POST | `/student-pricing-settings/upsert-student-pricing-settings` | isStoreUser |
 
 ---
 
-## Private Lesson Creation
+## Backend: Private Lesson Query Logic
 
+### `getStudentPrivateLessons(student_id, start, end, periodId)`
+```javascript
+PrivateLesson.find({
+  student_id: student_id,
+  period_id: periodId,
+  isDeleted: false,
+  start_time: { $gte: new Date(start), $lte: new Date(end) }
+})
 ```
-POST /private-lessons/
-Body: {
-  student_id, course_id, start_time, end_time, duration
+Filtered by: student, period, date range. Returns all lessons (no populate by default).
+
+### `createStudentPrivateLesson` (with MongoDB Transaction)
+Validates: `store_id`, `periodId`, `course_id`, `student_id`, `start_time`, `end_time`, `duration`. Creates `PrivateLesson` document inside a session.
+
+---
+
+## Backend: Export PDF — Full Logic (`exportStudentPrivateLessons`)
+
+This is the most complex controller in the private lessons module:
+
+**Step 1 — Fetch lessons:**
+```javascript
+// body: { student_id, date_from, date_to }
+const student = await studentHandler.getStudentById(student_id);
+const lessons = await privateLessonHandler.getStudentPrivateLessons(
+  student_id, date_from, date_to, periodId
+);
+```
+
+**Step 2 — Fetch rates in parallel:**
+```javascript
+const rate_promises = [];
+rate_promises.push(studentHourlyRatesHandler.getStoreStudentHourlyRates(store_id, student_id, periodId));
+rate_promises.push(hourlyRatesHandler.getStoreHourlyRates(store_id, periodId));
+const [student_rates, store_rates] = await Promise.all(rate_promises);
+```
+
+**Step 3 — Rate resolution per course (priority logic):**
+```javascript
+// For each unique course_id in the lessons:
+// 1. Look for student-specific rate for this course + period
+// 2. If not found → fall back to store-level rate for this course + period
+// 3. Result: rates_to_use = { [course_id]: rate_per_hour }
+const rates_to_use = {};
+lesson_course_ids.forEach(id => {
+  // find in student_rates first, then store_rates
+  // only assigns if period_rate.rate > 0
+});
+```
+
+**Step 4 — Generate PDF:**
+```javascript
+const fileContent = await createStudentLessonsPdf(
+  student, lessons, rates_to_use, date_from, date_to, courses
+);
+```
+
+**Step 5 — Upload to S3:**
+```javascript
+// Filename: "FirstName_LastName_DD-MM-YYYY_HH:mm_DD-MM-YYYY_HH:mm.pdf"
+// S3 path: "private-lesson-costs/{group_id}/{store_id}/{timestamp}_{filename}"
+// Bucket: "logeion-private-lesson-costs" (hardcoded, different from educational material bucket)
+const command = new PutObjectCommand({ Bucket, Key: s3Key, Body: fileContent, ContentType: 'application/pdf' });
+await s3Client.send(command);
+```
+
+**Step 6 — Return pre-signed URL (60s):**
+```javascript
+const signedUrl = await getSignedUrl(s3Client, new GetObjectCommand({
+  Bucket, Key: s3Key,
+  ResponseContentDisposition: `attachment; filename="${encodedFilename}"`,
+  ResponseContentType: 'application/pdf'
+}), { expiresIn: 60 });
+res.json({ success: true, downloadUrl: signedUrl, filename });
+```
+
+---
+
+## Backend: Hourly Rates — Aggregation Query
+
+`getStoreHourlyRates(storeId, periodId)` uses aggregation to filter `period_rates` to the current period:
+```javascript
+HourlyRates.aggregate([
+  { $match: { store_id: storeOid, isDeleted: false } },
+  { $addFields: {
+    period_rates_filtered: {
+      $filter: { input: '$period_rates', as: 'pr',
+        cond: { $eq: ['$$pr.period', periodOid] } }
+    }
+  }},
+  { $match: { 'period_rates_filtered.0': { $exists: true } } }
+  // Only returns rates that have an entry for this period
+])
+```
+
+---
+
+## Frontend: TypeScript Model
+
+```typescript
+interface PrivateLesson {
+  _id?: string; store_id?: string;
+  start_time: Date | string; end_time: Date | string;
+  duration: number;       // hours
+  course_id: string; student_id: string; period_id?: string;
+  isDeleted?: boolean;
 }
 ```
 
-1. Validate `store_id` and `period_id` (from default period)
-2. Call `privateLessonHandler.createPrivateLesson(...)`
-3. Lesson stored with timestamps for billing
+---
+
+## Frontend: Service (`services/private-lessons.service.ts`)
+
+```typescript
+getStudentPrivateLessons(studentId, start, end)
+  → GET /private-lessons/get-student-private-lessons/:studentId
+    ?start=<ISO>&end=<ISO>
+  → returns { success, message, lessons: PrivateLesson[] }
+
+addStudentPrivateLesson(lesson, student_id)
+  → POST /private-lessons/create-student-private-lesson
+  body: { lesson: { course_id, start_time, end_time, duration }, student_id }
+
+editStudentPrivateLesson(lesson)
+  → POST /private-lessons/edit-store-class   ⚠️ misnamed endpoint
+
+deleteStudentPrivateLesson(lessonId, permanently)
+  → DELETE /private-lessons/delete-student-private-lesson
+  body: { id: lessonId, permanently }
+
+exportStudentLessonPrices(payload)
+  → POST /private-lessons/export-student-private-lessons
+  body: { student_id, date_from, date_to }
+  → returns { success, downloadUrl, filename, message }
+```
+
+### `PriceSettingsService` (`services/price-settings.service.ts`)
+```typescript
+getStoreHourlyRates()
+  → GET /pricing-settings/get-store-pricing-settings
+
+upsertStoreHourlyRate(rate)
+  → POST /pricing-settings/upsert-store-pricing-settings
+
+getStudentHourlyRates(studentId)
+  → GET /student-pricing-settings/get-student-pricing-settings?studentId=xxx
+
+upsertStudentHourlyRate(rate)
+  → POST /student-pricing-settings/upsert-student-pricing-settings
+```
 
 ---
 
-## Querying Private Lessons
+## Frontend: Components
 
+### `StudentDetailsComponent` (manages lessons)
+Embedded within the student detail view:
+- Date range picker for lesson calendar
+- List of private lessons with edit/delete per lesson
+- "Add Lesson" form: course selector, date/time, duration
+- "Export Billing" button → opens `ExportStudentLessonPricesComponent`
+
+### `ExportStudentLessonPricesComponent` (`students/export-student-lesson-prices/`)
+```typescript
+// Date range picker → calls:
+PrivateLessonsService.exportStudentLessonPrices({
+  student_id: student._id,
+  date_from: selectedStart,
+  date_to: selectedEnd
+}).subscribe(res => {
+  if (res.success) window.open(res.downloadUrl, '_blank');
+});
 ```
-GET /private-lessons/student/:studentId?start=<ISO>&end=<ISO>
-```
-- Fetches lessons for a student within a date range
-- Scoped to the current default period
-- Used by the frontend calendar/schedule view
+
+### `SetRatesComponent` (`prices/set-rates/`)
+UI for managing store-level hourly rates per course. Part of the settings/pricing section.
 
 ---
 
-## Pricing — Hourly Rates
+## Availability System
 
-### Store-Level Rates (`models/hourly_rates.js`)
-Default rates per course for the store:
+### Teacher Availability (stored on Teacher document)
+```javascript
+period_availability: [{
+  period: ObjectId,
+  workdays: [{ dayOfWeek: 1–6, timeRanges: [{ startTime, endTime }] }]
+}]
 ```
-HourlyRate {
-  store_id    → Store
-  course_id   → Course
-  rate        Number (€/hour)
-  period_id   → TeachingPeriod
-}
+Set via `POST /teachers/upsert-teacher-details` with `changes.period_availability`.
+Backend validates with `normalizeWorkdays()`.
+
+### Student Unavailability (stored on Student document)
+```javascript
+period_unavailability: [{
+  period: ObjectId,
+  blockedDays: [{ dayOfWeek: 1–7, timeRanges: [{ startTime, endTime }] }]
+}]
 ```
+Set via `POST /students/upsert-student-unavailability`.
 
-### Student-Level Overrides (`models/student_hourly_rates.js`)
-Per-student pricing override:
-```
-StudentHourlyRate {
-  store_id    → Store
-  student_id  → Student
-  course_id   → Course
-  rate        Number (€/hour)
-  period_id   → TeachingPeriod
-}
-```
-
-**Pricing resolution:** When calculating cost for a private lesson:
-1. Check for `StudentHourlyRate` for this student + course → use if found
-2. Fall back to `HourlyRate` for the store + course
-
-### API Endpoints
-
-| Route | Description |
-|---|---|
-| `POST /pricing-settings/` | Set store hourly rate |
-| `PUT /pricing-settings/:id` | Update store rate |
-| `GET /pricing-settings/` | Get all store rates |
-| `POST /student-pricing-settings/` | Set student-specific rate |
-| `PUT /student-pricing-settings/:id` | Update student rate |
+Both are **stored but not yet enforced automatically** — the platform currently uses manual booking. The `ScheduledLesson` model exists for a future automated timetabling feature.
 
 ---
 
-## Availability Constraints
+## S3 Bucket Notes
 
-When scheduling lessons (manual or automated):
+Private lesson PDFs use a **different bucket** (`logeion-private-lesson-costs`) from educational materials (`logeion-educational-material`). The path is:
+```
+private-lesson-costs/{group_id}/{store_id}/{timestamp}_{StudentName}_{from}_{to}.pdf
+```
 
-**Teacher availability** (`Teacher.period_availability`):
-- Defined as workdays + time ranges per period
-- e.g., Teacher available Mon–Fri 16:00–20:00
-
-**Student unavailability** (`Student.period_unavailability`):
-- Defined as blocked days + time ranges per period
-- e.g., Student blocked Wed 17:00–19:00
-
-The scheduling logic must check both before placing a lesson.
-
----
-
-## PDF Generation for Student Lessons
-
-**Endpoint:** `GET /private-lessons/student/:studentId/pdf?start=<ISO>&end=<ISO>`
-
-Flow:
-1. Fetch all private lessons for student in date range
-2. Call `createStudentLessonsPdf(lessons, studentData)` (uses `pdfkit` + DejaVu fonts from `/assets/fonts/`)
-3. Upload generated PDF to **AWS S3**
-4. Return a **pre-signed S3 URL** (expires in 60s) for the frontend to download
-
-Helper: `helpers/createStudentLessonsPdf.js`
-
----
-
-## Teacher Availability Normalization
-
-`normalizeWorkdays(workdays)` in `controllers/handlers/teacher.js`:
-- Validates `dayOfWeek` is 1–6
-- Validates `startTime`/`endTime` format (`HH:mm`)
-- Deduplicates day entries
-- Called before saving availability to DB
+Files are not automatically deleted — they accumulate in S3 unless cleaned up manually.
