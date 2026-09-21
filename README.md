@@ -1,6 +1,10 @@
 # Frontistirio — Scheduling & Private Lessons Brain
 
 > **Full-stack reference** for private lesson tracking, hourly rate pricing (store-level + per-student overrides), PDF billing export, and the availability constraint system. Covers backend models, routes, controller logic, and the Angular frontend.
+>
+> **See also (2026-09-21):** `PrivateLesson` gained `teacher_id` (auto-picked when adding a lesson from the student page), `source`, `auto_key` and
+> `schedule_*` (auto-logged from the timetable). The same record now counts for teacher pay. All of this is in **`Frontistirio-teacher-hours-brain-repo`**.
+> ⚠️ This README was last verified 2026-06-16.
 
 ---
 
