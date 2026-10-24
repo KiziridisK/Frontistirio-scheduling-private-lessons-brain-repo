@@ -1,5 +1,12 @@
 # Frontistirio — Scheduling & Private Lessons Brain
 
+> **Κατάσταση τεκμηρίωσης** (σφραγίδα 2026-10-24) · τελευταία γραφή **2026-09-21**.
+> **Δεν φέρει επαλήθευση έναντι κώδικα** — κανόνας #4 του ευρετηρίου. Από εκείνη την ημερομηνία ο κώδικας
+> έχει προχωρήσει **89 commits** στο frontend και **20** στο API (όλο το repo, όχι μόνο αυτό το feature).
+> Σημερινά HEAD: frontend `0f466e0` / API `cabaa2c`.
+> Η γραφή της 2026-09-21 πρόσθεσε **μόνο παραπομπές**· το σώμα σταματά **2026-06-16**.
+> Τι είναι **γνωστό** ότι λείπει: §5 και §5.1 του ευρετηρίου (`Frontistirio-brain-repos-index`).
+
 > **Full-stack reference** for private lesson tracking, hourly rate pricing (store-level + per-student overrides), PDF billing export, and the availability constraint system. Covers backend models, routes, controller logic, and the Angular frontend.
 >
 > **See also (2026-09-21):** `PrivateLesson` gained `teacher_id` (auto-picked when adding a lesson from the student page), `source`, `auto_key` and
